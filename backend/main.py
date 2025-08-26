@@ -5,6 +5,8 @@ import pandas as pd
 from pydantic import BaseModel
 from io import BytesIO
 import os
+import zipfile
+import tempfile
 
 # Allow non-closed rings if needed
 os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
@@ -19,6 +21,7 @@ class PredictionInput(BaseModel):
 # --- Constants ----------------------------------------------------------------------------
 # Supported file types for upload
 SUPPORTED_FILE_TYPES = [".geojson", ".shp"]
+SHAPEFILE_EXTENSIONS = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
 # --- Constants End -------------------------------------------------------------------------
 
 # --- Utility Functions ---------------------------------------------------------------------
@@ -39,6 +42,30 @@ def read_geojson(file: UploadFile) -> gpd.GeoDataFrame:
         return gdf
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read GeoJSON: {str(e)}")
+# Used in /upload-map function to reads shapefiles     
+def read_shapefile(zip_file: UploadFile) -> gpd.GeoDataFrame:
+    """Read a zipped shapefile into a GeoDataFrame safely."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Save uploaded zip to temp directory
+            zip_path = os.path.join(tmpdir, zip_file.filename)
+            with open(zip_path, "wb") as f:
+                f.write(zip_file.file.read())
+            
+            # Extract zip
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(tmpdir)
+
+            # Find the .shp file
+            shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+            if not shp_files:
+                raise HTTPException(status_code=400, detail="No .shp file found in zip")
+            
+            shp_path = os.path.join(tmpdir, shp_files[0])
+            gdf = gpd.read_file(shp_path)
+            return gdf
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read shapefile: {str(e)}")
 # Used in /calculate-metrics function to extend calculations for fairness
 def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
     """
@@ -62,39 +89,47 @@ def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
 async def upload_map(file: UploadFile = File(...)):
     """
     Upload an electoral district map.
-    Supports GeoJSON and Shapefile formats.
+    
+    Supports:
+    - GeoJSON
+    - Shapefile (as a zipped file containing .shp, .shx, .dbf, etc.)
+    
     Returns metadata such as filename and number of districts.
     """
     validate_file_type(file.filename)
 
     if file.filename.endswith(".geojson"):
         gdf = read_geojson(file)
-        return JSONResponse(content={
-            "filename": file.filename,
-            "num_districts": len(gdf),
-            "status": "Map uploaded successfully"
-        })
+    elif file.filename.endswith(".zip"):  # Expect zipped shapefile
+        gdf = read_shapefile(file)
     else:
-        # Shapefile handling will require multi-file uploads and extraction
-        return JSONResponse(content={"status": "Shapefile upload not implemented yet"})
+        raise HTTPException(status_code=400, detail="Unsupported file format")
+
+    return JSONResponse(content={
+        "filename": file.filename,
+        "num_districts": len(gdf),
+        "status": "Map uploaded successfully"
+    })
 # Calculate Metrics Endpoint
 @app.post("/calculate-metrics")
 async def calculate_metrics(file: UploadFile):
     """
     Calculate fairness metrics for an uploaded electoral district map.
-    Accepts a GeoJSON file
-    Returns JSON with metrics such as compactness and efficiency gap.
+    Supports:
+    - GeoJSON
+    - Shapefile (as a zipped file)
     """
-    # --- Validation ---
     validate_file_type(file.filename)
 
-    # --- Read map ---
-    gdf = read_geojson(file)
+    if file.filename.endswith(".geojson"):
+        gdf = read_geojson(file)
+    elif file.filename.endswith(".zip"):
+        gdf = read_shapefile(file)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format")
 
-    # --- Calculate metrics ---
     metrics = calculate_basic_metrics(gdf)
 
-    # --- Return result ---
     return JSONResponse(content={
         "filename": file.filename,
         "metrics": metrics,
