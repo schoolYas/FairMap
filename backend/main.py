@@ -50,6 +50,32 @@ async def calculate_metrics(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/run-simulation")
+async def run_simulation(simulation_params: dict):
+    """
+    Run an ensemble simulation on the uploaded map.
+    Example simulation_params:
+    {
+        "num_simulations": 100,
+        "metric_weights": {"compactness": 0.5, "efficiency_gap": 0.5}
+    }
+    """
+    try:
+        num_simulations = simulation_params.get("num_simulations", 100)
+        metric_weights = simulation_params.get("metric_weights", {"compactness": 1, "efficiency_gap": 1})
+
+        # Dummy simulation logic for now (replace with GerryChain later)
+        simulated_results = [{"simulation": i, "score": i * 0.1} for i in range(num_simulations)]
+
+        return JSONResponse(content={
+            "num_simulations": num_simulations,
+            "metric_weights": metric_weights,
+            "results": simulated_results,
+            "status": "Simulation completed successfully"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/")
 async def root():
