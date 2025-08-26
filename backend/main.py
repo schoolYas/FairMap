@@ -31,6 +31,25 @@ async def upload_map(file: UploadFile = File(...)):
             return JSONResponse(content={"status": "Shapefile upload not implemented yet"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    
+@app.post("/calculate-metrics")
+async def calculate_metrics(file: UploadFile = File(...)):
+    if not file.filename.endswith(".geojson"):
+        raise HTTPException(status_code=400, detail="Invalid file type")
+    try:
+        gdf = gpd.read_file(file.file)
+        # Example metrics (you’ll replace with real calculations)
+        num_districts = len(gdf)
+        compactness = 0.75  # placeholder
+        efficiency_gap = 0.12  # placeholder
+        return JSONResponse(content={
+            "num_districts": num_districts,
+            "compactness": compactness,
+            "efficiency_gap": efficiency_gap
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/")
 async def root():
