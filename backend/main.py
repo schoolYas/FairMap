@@ -1,6 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse, FileResponse
 import geopandas as gpd
+import pandas as pd
 from pydantic import BaseModel
 from io import BytesIO
 import os
@@ -102,6 +103,43 @@ async def predict_outcome(input_data: PredictionInput):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/export-report")
+async def export_report(request: Request):
+    """
+    Expects a JSON payload like:
+    {
+        "metrics": [{"district": "A", "score": 0.5}, ...]
+    }
+    Returns a CSV file containing the metrics.
+    """
+    try:
+        # Parse JSON body
+        data = await request.json()
+
+        # Validate presence of "metrics"
+        metrics = data.get("metrics")
+        if not metrics or not isinstance(metrics, list):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid payload: 'metrics' key missing or not a list"}
+            )
+
+        # Create DataFrame and save CSV
+        df = pd.DataFrame(metrics)
+        file_path = "report.csv"
+        df.to_csv(file_path, index=False)
+
+        # Return file response
+        return FileResponse(
+            path=file_path,
+            filename="report.csv",
+            media_type="text/csv"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     
 @app.get("/")
 async def root():
