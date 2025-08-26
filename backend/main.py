@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import geopandas as gpd
+from pydantic import BaseModel
 from io import BytesIO
 import os
 
@@ -8,6 +9,12 @@ import os
 os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
 
 app = FastAPI()
+
+# Define input model for predictions
+class PredictionInput(BaseModel):
+    historical_votes: list  # e.g., [Dem_votes, Rep_votes]
+    demographics: dict      # e.g., {"population": 10000, "minority_pct": 30}
+
 
 @app.post("/upload-map")
 async def upload_map(file: UploadFile = File(...)):
@@ -76,7 +83,26 @@ async def run_simulation(simulation_params: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/predict-outcome")
+async def predict_outcome(input_data: PredictionInput):
+    try:
+        # Placeholder logic: simple weighted sum for demonstration
+        dem_votes = input_data.historical_votes[0]
+        rep_votes = input_data.historical_votes[1]
+        population_factor = input_data.demographics.get("population", 1)
 
+        predicted_dem_share = (dem_votes / (dem_votes + rep_votes)) * 100
+        predicted_rep_share = 100 - predicted_dem_share
+
+        return {
+            "predicted_dem_share": round(predicted_dem_share, 2),
+            "predicted_rep_share": round(predicted_rep_share, 2),
+            "status": "Prediction completed successfully"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/")
 async def root():
     return {"message": "FairMap backend is running"}
