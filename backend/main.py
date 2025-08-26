@@ -9,55 +9,98 @@ import os
 # Allow non-closed rings if needed
 os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
 
-app = FastAPI()
+app = FastAPI(title="FairMap Backend", version="1.0")
 
 # Define input model for predictions
 class PredictionInput(BaseModel):
     historical_votes: list  # e.g., [Dem_votes, Rep_votes]
     demographics: dict      # e.g., {"population": 10000, "minority_pct": 30}
 
+# --- Constants ----------------------------------------------------------------------------
+# Supported file types for upload
+SUPPORTED_FILE_TYPES = [".geojson", ".shp"]
+# --- Constants End -------------------------------------------------------------------------
 
+# --- Utility Functions ---------------------------------------------------------------------
+# Used in /upload-map function with SUPPORTED_FILE_TYPES constant 
+def validate_file_type(filename: str):
+    """Check if the uploaded file has a supported extension."""
+    if not any(filename.endswith(ext) for ext in SUPPORTED_FILE_TYPES):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid file type. Supported types: {', '.join(SUPPORTED_FILE_TYPES)}"
+        )
+# Used in /upload-map function to read and used to return content of geojson
+def read_geojson(file: UploadFile) -> gpd.GeoDataFrame:
+    """Read a GeoJSON file into a GeoDataFrame."""
+    try:
+        content = BytesIO(file.file.read())
+        gdf = gpd.read_file(content)
+        return gdf
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read GeoJSON: {str(e)}")
+# Used in /calculate-metrics function to extend calculations for fairness
+def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
+    """
+    Calculate placeholder fairness metrics.
+    This can be extended with real calculations like compactness, efficiency gap, etc.
+    """
+    num_districts = len(gdf)
+    
+    # Placeholder metrics
+    metrics = {
+        "num_districts": num_districts,
+        "compactness": 0.75,      # Replace with real calculation
+        "efficiency_gap": 0.12    # Replace with real calculation
+    }
+    return metrics
+# --- Utility Functions End ------------------------------------------------------------------
+
+# --- Endpoints ------------------------------------------------------------------------------
+# Upload Maps Endpoint
 @app.post("/upload-map")
 async def upload_map(file: UploadFile = File(...)):
-    # Validate file type
-    if not (file.filename.endswith(".geojson") or file.filename.endswith(".shp")):
-        raise HTTPException(status_code=400, detail="Invalid file type")
+    """
+    Upload an electoral district map.
+    Supports GeoJSON and Shapefile formats.
+    Returns metadata such as filename and number of districts.
+    """
+    validate_file_type(file.filename)
 
-    try:
-        if file.filename.endswith(".geojson"):
-            # Read file into memory and parse with GeoPandas
-            content = await file.read()
-            gdf = gpd.read_file(BytesIO(content))
-            
-            return JSONResponse(content={
-                "filename": file.filename,
-                "num_districts": len(gdf),
-                "status": "Map uploaded successfully"
-            })
-        else:
-            # For shapefiles, additional handling required (multiple files)
-            return JSONResponse(content={"status": "Shapefile upload not implemented yet"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-    
-@app.post("/calculate-metrics")
-async def calculate_metrics(file: UploadFile = File(...)):
-    if not file.filename.endswith(".geojson"):
-        raise HTTPException(status_code=400, detail="Invalid file type")
-    try:
-        gdf = gpd.read_file(file.file)
-        # Example metrics (you’ll replace with real calculations)
-        num_districts = len(gdf)
-        compactness = 0.75  # placeholder
-        efficiency_gap = 0.12  # placeholder
+    if file.filename.endswith(".geojson"):
+        gdf = read_geojson(file)
         return JSONResponse(content={
-            "num_districts": num_districts,
-            "compactness": compactness,
-            "efficiency_gap": efficiency_gap
+            "filename": file.filename,
+            "num_districts": len(gdf),
+            "status": "Map uploaded successfully"
         })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    else:
+        # Shapefile handling will require multi-file uploads and extraction
+        return JSONResponse(content={"status": "Shapefile upload not implemented yet"})
+# Calculate Metrics Endpoint
+@app.post("/calculate-metrics")
+async def calculate_metrics(file: UploadFile):
+    """
+    Calculate fairness metrics for an uploaded electoral district map.
+    Accepts a GeoJSON file
+    Returns JSON with metrics such as compactness and efficiency gap.
+    """
+    # --- Validation ---
+    validate_file_type(file.filename)
 
+    # --- Read map ---
+    gdf = read_geojson(file)
+
+    # --- Calculate metrics ---
+    metrics = calculate_basic_metrics(gdf)
+
+    # --- Return result ---
+    return JSONResponse(content={
+        "filename": file.filename,
+        "metrics": metrics,
+        "status": "Metrics calculated successfully"
+    })
+# Run Simulation Endpoint 
 @app.post("/run-simulation")
 async def run_simulation(simulation_params: dict):
     """
