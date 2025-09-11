@@ -1,5 +1,4 @@
 import logging
-import mimetypes
 import asyncio
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
@@ -13,6 +12,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from time import time
 from collections import defaultdict
+from logging_setup import logger, UPLOAD_SUCCESS, UPLOAD_FAILURE, UPLOAD_SIZE, UPLOAD_LATENCY
 
 # Allow non-closed rings if needed
 os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
@@ -69,6 +69,22 @@ async def read_geojson_async(file: BytesIO) -> gpd.GeoDataFrame:
 
 async def read_shapefile_async(tmp_zip_path: str, tmpdir: str) -> gpd.GeoDataFrame:
     return await asyncio.to_thread(lambda: gpd.read_file(tmp_zip_path))
+
+def process_upload(file):
+    import time
+    start = time.time()
+
+    try:
+        # Do something with the file
+        size = len(file.read())
+        UPLOAD_SIZE.observe(size)
+        UPLOAD_SUCCESS.inc()
+        logger.info("Upload succeeded", extra={"filename": file.name, "status": 200})
+    except Exception as e:
+        UPLOAD_FAILURE.inc()
+        logger.error(f"Upload failed: {e}", extra={"filename": file.name, "status": 500})
+    finally:
+        UPLOAD_LATENCY.observe(time.time() - start)
 
 
 def read_geojson(file: UploadFile) -> gpd.GeoDataFrame:
