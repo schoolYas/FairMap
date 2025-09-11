@@ -94,21 +94,24 @@ def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
 # --- Endpoints ------------------------------------------------------------------------------
 @app.post("/upload-map")
 async def upload_map(file: UploadFile = File(...)):
-    """Upload an electoral district map (GeoJSON or zipped shapefile)."""
+    """Upload an electoral district map (GeoJSON or zipped shapefile) and return GeoJSON for visualization."""
     validate_file_type(file.filename)
 
     if file.filename.endswith(".geojson"):
         gdf = read_geojson(file)
-    elif file.filename.endswith(".zip"):  # Expect zipped shapefile
+    elif file.filename.endswith(".zip"):
         gdf = read_shapefile(file)
     else:
         raise HTTPException(status_code=400, detail="Unsupported file format")
 
+    # Return GeoJSON object for frontend
     return JSONResponse(content={
         "filename": file.filename,
         "num_districts": len(gdf),
+        "geojson": gdf.__geo_interface__,  # object, not string
         "status": "Map uploaded successfully"
     })
+
 
 @app.post("/calculate-metrics")
 async def calculate_metrics(file: UploadFile):

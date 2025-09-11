@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import "./App.css";
-
+import "leaflet/dist/leaflet.css";
+import "leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility.css";
 import Upload from "./pages/Upload";
 import Metrics from "./pages/Metrics";
 import About from "./pages/About";
@@ -37,5 +38,7 @@ function Home()
     </main>
   );
 }
+
+
 
 export default App;
