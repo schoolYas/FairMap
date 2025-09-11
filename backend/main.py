@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 import asyncio
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
@@ -10,6 +11,8 @@ import os
 import zipfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from time import time
+from collections import defaultdict
 
 # Allow non-closed rings if needed
 os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
@@ -45,6 +48,14 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB max upload size
 SUPPORTED_FILE_TYPES = [".geojson", ".shp"]
 SHAPEFILE_EXTENSIONS = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB max upload size
+CHUNK_SIZE = 4 * 1024 * 1024
+ALLOWED_MIME_TYPES = {
+    ".geojson": "application/geo+json",
+    ".zip": "application/zip"
+}
+ip_upload_history = defaultdict(list)
+UPLOAD_RATE_LIMIT = 5  # max uploads per IP per minute
+CRS_STANDARD = "EPSG:4326"
 executor = ThreadPoolExecutor(max_workers=4)
 # --- Constants End -------------------------------------------------------------------------
 
@@ -52,14 +63,12 @@ executor = ThreadPoolExecutor(max_workers=4)
 def validate_file_type(filename: str):
     if not filename.endswith((".geojson", ".zip")):
         raise HTTPException(status_code=400, detail="Unsupported file type")
+    
+async def read_geojson_async(file: BytesIO) -> gpd.GeoDataFrame:
+    return await asyncio.to_thread(lambda: gpd.read_file(file))
 
-async def read_geojson_async(file: UploadFile):
-    """Run the blocking read_geojson in a thread safely."""
-    return await asyncio.to_thread(read_geojson, file)
-
-async def read_shapefile_async(file: UploadFile):
-    """Run the blocking read_shapefile in a thread safely."""
-    return await asyncio.to_thread(read_shapefile, file)
+async def read_shapefile_async(tmp_zip_path: str, tmpdir: str) -> gpd.GeoDataFrame:
+    return await asyncio.to_thread(lambda: gpd.read_file(tmp_zip_path))
 
 
 def read_geojson(file: UploadFile) -> gpd.GeoDataFrame:
@@ -109,46 +118,94 @@ def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
 
 # --- Endpoints ------------------------------------------------------------------------------
 @app.post("/upload-map")
-async def upload_map(file: UploadFile = File(...)):
-    """Upload an electoral district map and return GeoJSON for visualization."""
+async def upload_map(file: UploadFile = File(...), request: Request = None):
+    client_ip = request.client.host if request else "unknown"
+    
+    # --- Rate limiting ---
+    now = time()
+    window_start = now - 60
+    ip_upload_history[client_ip] = [t for t in ip_upload_history[client_ip] if t > window_start]
+    if len(ip_upload_history[client_ip]) >= UPLOAD_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many uploads; please wait before uploading again")
+    ip_upload_history[client_ip].append(now)
+
     try:
+        # --- File type & MIME type validation ---
         validate_file_type(file.filename)
+        ext = os.path.splitext(file.filename)[1].lower()
+        ALLOWED_MIME_TYPES = {".geojson": "application/geo+json", ".zip": "application/zip"}
+        if file.content_type != ALLOWED_MIME_TYPES.get(ext):
+            raise HTTPException(status_code=400, detail=f"Invalid MIME type: {file.content_type}")
 
-        # --- File size check ---
-        contents = await file.read()
-        if len(contents) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail="File too large. Maximum allowed size is 50 MB.")
-        file.file.seek(0)  # Reset pointer after reading
+        # --- Streaming / file size check ---
+        CHUNK_SIZE = 4 * 1024 * 1024
+        total_bytes = 0
+        temp_file = BytesIO()
+        while chunk := await file.read(CHUNK_SIZE):
+            total_bytes += len(chunk)
+            if total_bytes > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail="File too large")
+            temp_file.write(chunk)
+        temp_file.seek(0)
 
-        # --- Read file using thread pool to avoid blocking ---
-        if file.filename.endswith(".geojson"):
-            gdf = await read_geojson_async(file)
-        elif file.filename.endswith(".zip"):
-            gdf = await read_shapefile_async(file)
+        logger.info(f"Upload attempt: {file.filename}, size={total_bytes} bytes, from IP={client_ip}")
+
+        # --- Read GeoJSON or Shapefile ---
+        if ext == ".geojson":
+            gdf = await read_geojson_async(temp_file)
+        elif ext == ".zip":
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, os.path.basename(file.filename))
+                with open(zip_path, "wb") as f:
+                    f.write(temp_file.getbuffer())
+
+                # --- Zip traversal safety ---
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    for member in zip_ref.namelist():
+                        if os.path.isabs(member) or ".." in member:
+                            raise HTTPException(status_code=400, detail="Invalid zip contents")
+                    zip_ref.extractall(tmpdir)
+
+                shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+                if not shp_files:
+                    raise HTTPException(status_code=400, detail="No .shp file found in zip")
+                shp_path = os.path.join(tmpdir, shp_files[0])
+                gdf = await read_shapefile_async(shp_path, tmpdir)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format")
 
-        # --- Geometry validation ---
-        if gdf is not None and not gdf.is_valid.all():
-            logger.warning(f"Some geometries in '{file.filename}' are invalid")
+        # --- Fix invalid geometries ---
+        if not gdf.is_valid.all():
+            logger.warning(f"Invalid geometries detected in '{file.filename}', attempting to fix with buffer(0)")
+            gdf["geometry"] = gdf.buffer(0)
+            if not gdf.is_valid.all():
+                logger.warning(f"Some geometries in '{file.filename}' could not be fixed")
 
-        # --- Consistent GeoJSON format ---
+        # --- CRS normalization ---
+        if gdf.crs is None or gdf.crs.to_string() != CRS_STANDARD:
+            gdf = gdf.to_crs(CRS_STANDARD)
+            logger.info(f"Reprojected '{file.filename}' to {CRS_STANDARD}")
+
+        # --- Prepare response metadata ---
         geojson_obj = gdf.__geo_interface__ if gdf is not None else {"type": "FeatureCollection", "features": []}
+        bbox = gdf.total_bounds.tolist() if gdf is not None else []
+        num_features = len(gdf) if gdf is not None else 0
 
+        logger.info(f"Upload success: {file.filename}, districts={num_features}")
         return JSONResponse(content={
             "filename": file.filename,
-            "num_districts": len(gdf) if gdf is not None else 0,
+            "num_districts": num_features,
             "geojson": geojson_obj,
+            "bbox": bbox,
             "status": "Map uploaded successfully"
         })
 
     except HTTPException as e:
+        logger.warning(f"Upload failed ({file.filename}) from {client_ip}: {e.detail}")
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error during upload: {str(e)}")
+        logger.error(f"Unexpected error during upload ({file.filename}) from {client_ip}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-
 
 @app.post("/calculate-metrics")
 async def calculate_metrics(file: UploadFile):
