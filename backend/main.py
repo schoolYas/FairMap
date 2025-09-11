@@ -491,9 +491,9 @@ async def calculate_metrics(file: UploadFile):
     validate_file_type(file.filename)
 
     if file.filename.endswith(".geojson"):
-        gdf = read_geojson(file)
+        gdf = await read_geojson(file)
     elif file.filename.endswith(".zip"):
-        gdf = read_shapefile(file)
+        gdf = await read_shapefile_zip(file)
     else:
         raise HTTPException(status_code=400, detail="Unsupported file format",headers = {"X-Error-Code": "invalid_file_format"})
 
