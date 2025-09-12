@@ -1,0 +1,9 @@
+{
+  "metrics": [
+    {"district": "A", "score": 0.5},
+    {"district": "B", "score": 0.7},
+    {"district": "C", "score": 0.3}
+  ]
+}
+
+
