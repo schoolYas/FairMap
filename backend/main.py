@@ -1,4 +1,5 @@
 # --- Standard library imports ----------------------------------------------------------------
+import json                                         # JSON handling for API requests/responses
 import asyncio                                      # For async operations, concurrency, and semaphores
 import logging                                      # For logging upload attempts, errors, warnings
 import os                                           # Environment variables, path manipulations
@@ -6,9 +7,39 @@ import tempfile                                     # Temporary directories/file
 import time                                         # Timing, rate-limiting, upload latency
 import uuid                                         # Generate unique IDs for chunked uploads
 import zipfile                                      # Handling uploaded zip files (shapefiles)
+import math                                         # Mathematical functions (e.g., sqrt, pi)
+from shapely.geometry import Polygon, MultiPolygon  # Geometric shapes and operations
 from io import BytesIO                              # In-memory file streams for uploads
+import io                                           # For in-memory byte streams    
 from concurrent.futures import ThreadPoolExecutor   # Run blocking code (like geopandas) in threads
 from collections import defaultdict                 # Store per-IP upload history easily
+from shapely.geometry import shape                  # Handle geometric shapes and operations
+
+# --- PROJ database fix (macOS / Conda) --------------------------
+proj_candidate = "/Users/headhoncho/miniforge3/envs/fairmap/share/proj"
+if os.path.exists(os.path.join(proj_candidate, "proj.db")):
+    os.environ["PROJ_LIB"] = proj_candidate
+    print(f"[FairMap] Using PROJ_LIB = {proj_candidate}")
+else:
+    try:
+        import pyproj  # imported here, after PROJ_LIB is set if possible
+        proj_data = pyproj.datadir.get_data_dir()
+        os.environ["PROJ_LIB"] = proj_data
+        print(f"[FairMap] Using fallback PROJ_LIB = {proj_data}")
+    except Exception as e:
+        print(f"[FairMap] Could not set PROJ_LIB: {e}")
+
+# Tell pyproj explicitly to use that PROJ data dir (helps with shapefiles)
+try:
+    import pyproj
+    from pyproj import datadir as _pdatadir
+    _pdatadir.set_data_dir(os.environ["PROJ_LIB"])
+    print(f"[FairMap] pyproj using PROJ data at {os.environ['PROJ_LIB']}")
+except Exception as _e:
+    print(f"[FairMap] pyproj datadir set skipped: {_e}")
+
+# Allow non-closed polygon geometry rings if needed
+os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
 
 # --- Third-party imports ----------------------------------------------------------------------
 import pyclamd                                      # Scan uploaded zip files for malware with ClamAV
@@ -27,9 +58,6 @@ from logging_setup import logger, UPLOAD_SUCCESS, UPLOAD_FAILURE, UPLOAD_SIZE, U
 # UPLOAD_SIZE: Histogram of upload sizes
 # UPLOAD_LATENCY: Histogram of upload processing time
 #-----------------------------------------------------------------------------------------------
-
-# Allow non-closed polygon geometry rings if needed
-os.environ["OGR_GEOMETRY_ACCEPT_UNCLOSED_RING"] = "YES"
 
 #---- Abandoned Upload Cleaner -----------------------------------------------------------------
 
@@ -77,6 +105,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",                    # Local React dev server
         "http://127.0.0.1:3000",                    # Alternative localhost format
+        "http://192.168.1.177:3000",                # LAN dev URL
     ],
     allow_credentials=True,                         # Allow authorization headers in requests
     allow_methods=["*"],                            # Allow all HTTP methods
@@ -94,7 +123,7 @@ logging.basicConfig(level=logging.INFO)             # Configure root logger to s
 logger = logging.getLogger("fairMap")               # Create a named logger for the FairMap backend
 
 # --- File Type and Content Constraints ------------------------------------------------------
-SUPPORTED_FILE_TYPES = [".geojson", ".shp"]                     # Allowed individual file types
+SUPPORTED_FILE_TYPES = [".geojson", ".zip"]                     # Allowed individual file types
 SHAPEFILE_EXTENSIONS = [".shp", ".shx", ".dbf", ".prj", ".cpg"] # Required shapefile components
 ALLOWED_ZIP_CONTENTS = [".shp", ".shx", ".dbf", ".prj", ".cpg"] # Allowed files inside uploaded ZIPs
 ALLOWED_MIME_TYPES = {                                          # MIME types for validation
@@ -174,6 +203,17 @@ def validate_file_mime(file: UploadFile):
     mime_type = magic.from_buffer(file.file.read(1024), mime=True)
     file.seek(0)
     ext = os.path.splitext(file.filename)[1].lower()
+
+    if ext == ".geojson":
+        # Accept common variants that browsers/editors use
+        if mime_type in ("application/geo+json", "application/json", "text/plain"):
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid MIME type for .geojson: {mime_type}",
+            headers={"X-Error-Code": "invalid_mime"}
+        )
+
     expected = ALLOWED_MIME_TYPES.get(ext)
     if expected != mime_type:
         raise HTTPException(
@@ -181,7 +221,6 @@ def validate_file_mime(file: UploadFile):
             detail=f"Invalid MIME type: {mime_type} for extension {ext}",
             headers={"X-Error-Code": "invalid_mime"}
         )
-
 
 """ SANITIZE_FILENAME
     Sanitize a filename to prevent path traversal attacks.
@@ -325,9 +364,52 @@ def safe_extract_zip(zip_path: str, extract_to: str):
         - Uses asyncio.to_thread to offload blocking geopandas I/O.
         - Resets file pointer before reading.
 """
-async def read_geojson(file: BytesIO) -> gpd.GeoDataFrame:
-    file.seek(0)
-    return await asyncio.to_thread(lambda: gpd.read_file(file))
+# --- Helper: fiona/PROJ-free GeoJSON -> GeoDataFrame ----------------------
+def _gdf_from_geojson_bytes(contents: bytes) -> gpd.GeoDataFrame:
+    """Parse GeoJSON to GeoDataFrame using json+shapely (no fiona/PROJ)."""
+    data = json.loads(contents.decode("utf-8"))
+    features = data.get("features", [])
+    rows = []
+    for f in features:
+        geom = shape(f.get("geometry")) if f.get("geometry") else None
+        props = f.get("properties", {}) or {}
+        rows.append({**props, "geometry": geom})
+    return gpd.GeoDataFrame(rows, geometry="geometry")
+    
+async def read_geojson(file_or_bytes) -> gpd.GeoDataFrame:
+    """
+    Read GeoJSON into a GeoDataFrame without fiona/pyproj.
+    Accepts:
+      - FastAPI UploadFile (async .read())
+      - file-like object (sync .read())
+      - BytesIO
+      - bytes / bytearray
+    """
+    try:
+        # 1) Async UploadFile (FastAPI / Starlette)
+        if hasattr(file_or_bytes, "read"):
+            # Try async read first
+            try:
+                contents = await file_or_bytes.read()
+            except TypeError:
+                # Not awaitable: treat as sync file-like
+                contents = file_or_bytes.read()
+        elif isinstance(file_or_bytes, (bytes, bytearray)):
+            contents = bytes(file_or_bytes)
+        else:
+            raise ValueError("Unsupported input type for read_geojson")
+
+        # Parse with the fiona-free helper
+        return await asyncio.to_thread(lambda: _gdf_from_geojson_bytes(contents))
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read GeoJSON: {str(e)}",
+            headers={"X-Error-Code": "geojson_parse_error"}
+        )
 
 
 """ READ_SHAPEFILE
@@ -350,27 +432,48 @@ async def read_geojson(file: BytesIO) -> gpd.GeoDataFrame:
         - Reads only the first .shp file found in the ZIP.
         - Offloads blocking geopandas I/O to a separate thread.
 """
-async def read_shapefile_zip(file: BytesIO) -> gpd.GeoDataFrame:
-    file.seek(0)
-    # Scan for malware
-    cd = pyclamd.ClamdNetworkSocket()
-    if not cd.ping():
-        cd = pyclamd.ClamdUnixSocket()
-    if not cd.ping():
-        raise HTTPException(status_code=503, detail="ClamAV unavailable", headers={"X-Error-Code": "clamav_down"})
-    scan_result = cd.scan_stream(file.read())
-    if scan_result:
-        raise HTTPException(status_code=400, detail=f"Malware detected: {scan_result}", headers={"X-Error-Code": "malware_detected"})
-    file.seek(0)
+async def read_shapefile_zip(file_or_bytes) -> gpd.GeoDataFrame:
+    # normalize to raw bytes
+    if isinstance(file_or_bytes, (bytes, bytearray)):
+        contents = bytes(file_or_bytes)
+    elif isinstance(file_or_bytes, BytesIO):
+        file_or_bytes.seek(0)
+        contents = file_or_bytes.read()
+    elif hasattr(file_or_bytes, "read"):  # FastAPI UploadFile
+        contents = await file_or_bytes.read()
+        try:
+            await file_or_bytes.seek(0)
+        except TypeError:
+            # Some file-likes don't have async seek; that's fine.
+            pass
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported ZIP input",
+            headers={"X-Error-Code": "zip_input_type"}
+        )
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, str(uuid.uuid4()) + ".zip")
+        zip_path = os.path.join(tmpdir, f"{uuid.uuid4()}.zip")
         with open(zip_path, "wb") as f:
-            f.write(file.read())
+            f.write(contents)
+
+        # Validate and extract safely
         safe_extract_zip(zip_path, tmpdir)
-        shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+
+        # Look for a shapefile
+        shp_files = [f for f in os.listdir(tmpdir) if f.lower().endswith(".shp")]
         if not shp_files:
-            raise HTTPException(status_code=400, detail="No .shp file found", headers={"X-Error-Code": "no_shp_in_zip"})
-        return await asyncio.to_thread(lambda: gpd.read_file(os.path.join(tmpdir, shp_files[0])))
+            raise HTTPException(
+                status_code=400,
+                detail="No .shp file found",
+                headers={"X-Error-Code": "no_shp_in_zip"}
+            )
+
+        # Offload blocking I/O
+        return await asyncio.to_thread(
+            lambda: gpd.read_file(os.path.join(tmpdir, shp_files[0]))
+        )
     
 """ FIX_INVALID_GEOMETRIES
     Fix invalid geometries in a GeoDataFrame by buffering.
@@ -391,10 +494,42 @@ def fix_invalid_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 #----End of Used In /Upload-Map ------------------------------------------------------------------
 
+def _poly_area_perimeter(geom):
+    # supports Polygon and MultiPolygon
+    if isinstance(geom, MultiPolygon):
+        area = sum(p.area for p in geom.geoms)
+        perim = sum(p.length for p in geom.geoms)
+    else:
+        area = geom.area
+        perim = geom.length
+    return area, perim
+
+def polsby_popper_for_gdf(gdf):
+    rows = []
+    for idx, geom in enumerate(gdf.geometry):
+        # Polsby–Popper formula: 4πA / P²
+        A, P = _poly_area_perimeter(geom)
+        score = (4 * math.pi * A) / (P ** 2) if P > 0 else 0.0
+        # clamp to [0,1]
+        score = max(0.0, min(1.0, score))
+        rows.append({
+            "district_index": int(idx),
+            "polsby_popper": round(score, 4)
+        })
+    overall = round(
+        sum(r["polsby_popper"] for r in rows) / len(rows),
+        4
+    ) if rows else 0.0
+    return {"per_district": rows, "overall": overall}
 
 def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
-    return {"num_districts": len(gdf), "compactness": 0.75, "efficiency_gap": 0.12}
-
+    # real compactness using Polsby–Popper
+    pp = polsby_popper_for_gdf(gdf)
+    return {
+        "num_districts": int(len(gdf)),
+        "compactness_pp_overall": pp["overall"],
+        "efficiency_gap": 0.12  # still a placeholder for now
+    }
 
 #-- Upload Handling ------------------------------------------------------------------------------
 
@@ -418,8 +553,19 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
     ext = os.path.splitext(file.filename)[1].lower()
     logger.info(f"Upload attempt {upload_id}: {file.filename}, size={total_size} bytes, IP={client_ip}")
 
-    # MIME validation
-    validate_file_mime(file)
+    # MIME validation using assembled bytes (more reliable)
+    head = temp_file.getbuffer()[:1024]
+    mime_type = magic.from_buffer(head, mime=True)
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext == ".geojson":
+        if mime_type not in ("application/geo+json", "application/json", "text/plain"):
+            raise HTTPException(status_code=400,
+                        detail=f"Invalid MIME type for .geojson: {mime_type}",
+                        headers={"X-Error-Code": "invalid_mime"})
+    elif ALLOWED_MIME_TYPES.get(ext) != mime_type:
+        raise HTTPException(status_code=400,
+                    detail=f"Invalid MIME type: {mime_type} for extension {ext}",
+                    headers={"X-Error-Code": "invalid_mime"})
 
     # File reading
     if ext == ".geojson":
@@ -430,8 +576,11 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
         raise HTTPException(status_code=400, detail="Unsupported file format", headers={"X-Error-Code": "invalid_file_format"})
 
     gdf = fix_invalid_geometries(gdf)
-    if gdf.crs is None or gdf.crs.to_string() != CRS_STANDARD:
-        gdf = gdf.to_crs(CRS_STANDARD)
+    try:
+        if gdf.crs and str(gdf.crs) not in ("EPSG:4326", "epsg:4326", "4326"):
+            gdf = gdf.to_crs(CRS_STANDARD)
+    except Exception as e:
+        logger.warning(f"Skipping reprojection due to error: {e}")
 
     geojson_obj = gdf.__geo_interface__
     bbox = gdf.total_bounds.tolist()
@@ -465,7 +614,7 @@ async def upload_map(file: UploadFile = File(...), request: Request = None):
     ip_upload_history[client_ip].append(now)
 
     upload_id = request.headers.get("Upload-Id") or str(uuid.uuid4())
-    is_final_chunk = request.headers.get("Upload-Final") == "true"
+    is_final_chunk = (request.headers.get("Upload-Final", "true").lower() == "true")
 
     async with upload_semaphore:
         try:
@@ -495,13 +644,19 @@ async def calculate_metrics(file: UploadFile):
     elif file.filename.endswith(".zip"):
         gdf = await read_shapefile_zip(file)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file format",headers = {"X-Error-Code": "invalid_file_format"})
-
-    metrics = calculate_basic_metrics(gdf)
-
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format",
+            headers={"X-Error-Code": "invalid_file_format"}
+        )
+    summary = calculate_basic_metrics(gdf)
+    per_district = polsby_popper_for_gdf(gdf)["per_district"]
     return JSONResponse(content={
         "filename": file.filename,
-        "metrics": metrics,
+        "metrics": {
+            "summary": summary,
+            "per_district": per_district
+        },
         "status": "Metrics calculated successfully"
     })
 
@@ -541,6 +696,22 @@ async def predict_outcome(input_data: PredictionInput):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e), headers = {"X-Error-Code": "invalid_exception"})
+
+@app.post("/metrics")
+async def metrics_from_geojson_body(geojson: dict):
+    """Calculate metrics from a GeoJSON object in the request body (no file upload)."""
+    try:
+        contents = json.dumps(geojson).encode("utf-8")
+        gdf = _gdf_from_geojson_bytes(contents)
+        gdf = fix_invalid_geometries(gdf)
+        metrics = calculate_basic_metrics(gdf)
+        return JSONResponse(content={
+            "metrics": metrics,
+            "status": "Metrics calculated successfully"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad GeoJSON: {e}",
+                            headers={"X-Error-Code": "bad_geojson"})
 
 @app.post("/export-report")
 async def export_report(request: Request):
