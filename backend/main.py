@@ -204,6 +204,7 @@ def validate_file_mime(file: UploadFile):
     file.seek(0)
     ext = os.path.splitext(file.filename)[1].lower()
 
+
     if ext == ".geojson":
         # Accept common variants that browsers/editors use
         if mime_type in ("application/geo+json", "application/json", "text/plain"):
@@ -378,33 +379,40 @@ def _gdf_from_geojson_bytes(contents: bytes) -> gpd.GeoDataFrame:
     
 async def read_geojson(file_or_bytes) -> gpd.GeoDataFrame:
     """
-    Read GeoJSON into a GeoDataFrame without fiona/pyproj.
-    Accepts:
-      - FastAPI UploadFile (async .read())
-      - file-like object (sync .read())
-      - BytesIO
-      - bytes / bytearray
+    SAFE & CORRECT GeoJSON reader.
+    Works with:
+      - UploadFile (async)
+      - BytesIO (in-memory)
+      - bytes
+    Ensures content is only read once.
     """
     try:
-        # 1) Async UploadFile (FastAPI / Starlette)
-        if hasattr(file_or_bytes, "read"):
-            # Try async read first
+        # ---- Case 1: BytesIO (--> always used in /upload-map) ----
+        if isinstance(file_or_bytes, BytesIO):
+            file_or_bytes.seek(0)
+            contents = file_or_bytes.read()
+
+        # ---- Case 2: UploadFile (FastAPI) ----
+        elif hasattr(file_or_bytes, "read"):
             try:
                 contents = await file_or_bytes.read()
             except TypeError:
-                # Not awaitable: treat as sync file-like
                 contents = file_or_bytes.read()
+
+        # ---- Case 3: Raw bytes ----
         elif isinstance(file_or_bytes, (bytes, bytearray)):
             contents = bytes(file_or_bytes)
+
         else:
             raise ValueError("Unsupported input type for read_geojson")
 
-        # Parse with the fiona-free helper
+        if not contents or len(contents) == 0:
+            raise ValueError("Empty file or could not read file contents.")
+
+        # Parse JSON strictly once
         return await asyncio.to_thread(lambda: _gdf_from_geojson_bytes(contents))
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         raise HTTPException(
             status_code=400,
             detail=f"Failed to read GeoJSON: {str(e)}",
@@ -534,47 +542,59 @@ def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
 #-- Upload Handling ------------------------------------------------------------------------------
 
 async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_final_chunk: bool):
-    # Enforce max file size per chunk
-    chunk = await file.read(CHUNK_SIZE)
-    if upload_id not in UPLOAD_CHUNKS:
-        UPLOAD_CHUNKS[upload_id] = BytesIO()
-    UPLOAD_CHUNKS[upload_id].write(chunk)
-    total_size = UPLOAD_CHUNKS[upload_id].getbuffer().nbytes
-    if total_size > MAX_FILE_SIZE:
-        del UPLOAD_CHUNKS[upload_id]
-        raise HTTPException(status_code=413, detail="File exceeds max size", headers={"X-Error-Code": "max_file_size"})
-    UPLOAD_CHUNKS_LAST_MODIFIED[upload_id] = time.time()
 
-    if not is_final_chunk:
-        return JSONResponse(content={"upload_id": upload_id, "status": "chunk_received"})
+ # Read ENTIRE file at once (NO CHUNKING)
+    contents = await file.read()
 
-    temp_file = UPLOAD_CHUNKS.pop(upload_id)
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds max size",
+            headers={"X-Error-Code": "max_file_size"}
+        )
+
+    temp_file = BytesIO(contents)
     temp_file.seek(0)
     ext = os.path.splitext(file.filename)[1].lower()
-    logger.info(f"Upload attempt {upload_id}: {file.filename}, size={total_size} bytes, IP={client_ip}")
 
-    # MIME validation using assembled bytes (more reliable)
-    head = temp_file.getbuffer()[:1024]
+    # --- MIME VALIDATION (after file fully assembled) ---
+    head = bytes(temp_file.getbuffer()[:1024])  # convert memoryview → bytes
     mime_type = magic.from_buffer(head, mime=True)
-    ext = os.path.splitext(file.filename)[1].lower()
+
     if ext == ".geojson":
         if mime_type not in ("application/geo+json", "application/json", "text/plain"):
-            raise HTTPException(status_code=400,
-                        detail=f"Invalid MIME type for .geojson: {mime_type}",
-                        headers={"X-Error-Code": "invalid_mime"})
-    elif ALLOWED_MIME_TYPES.get(ext) != mime_type:
-        raise HTTPException(status_code=400,
-                    detail=f"Invalid MIME type: {mime_type} for extension {ext}",
-                    headers={"X-Error-Code": "invalid_mime"})
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid MIME type for .geojson: {mime_type}",
+                headers={"X-Error-Code": "invalid_mime"}
+            )
+    elif ext == ".zip" and mime_type not in (
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ZIP MIME type: {mime_type}",
+            headers={"X-Error-Code": "invalid_mime"}
+        )
 
-    # File reading
+    # --- Decode uploaded file into GeoDataFrame ---
     if ext == ".geojson":
+        temp_file.seek(0)
         gdf = await read_geojson(temp_file)
+
     elif ext == ".zip":
         gdf = await read_shapefile_zip(temp_file)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file format", headers={"X-Error-Code": "invalid_file_format"})
 
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format",
+            headers={"X-Error-Code": "invalid_file_format"}
+        )
+
+    # --- FIX GEOMETRIES AND PROJECT CRS ---
     gdf = fix_invalid_geometries(gdf)
     try:
         if gdf.crs and str(gdf.crs) not in ("EPSG:4326", "epsg:4326", "4326"):
@@ -582,25 +602,60 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
     except Exception as e:
         logger.warning(f"Skipping reprojection due to error: {e}")
 
-    geojson_obj = gdf.__geo_interface__
-    bbox = gdf.total_bounds.tolist()
-    num_features = len(gdf)
+    # --- SAVE TEMP FILE FOR METRIC SCRIPT ---
+    safe_filename = sanitize_filename(file.filename)
+    temp_path = f"/tmp/{upload_id}.geojson"
+    gdf.to_file(temp_path, driver="GeoJSON")
 
-    logger.info(f"Upload success {upload_id}: {file.filename}, features={num_features}")
+    # ============================================================
+    # 🔥 RUN WEIGHTED METRIC COMPUTATION ON THE UPLOADED FILE
+    # ============================================================
+    try:
+        from calculate_metrics import compute_metrics_for_file
+        weighted_path = compute_metrics_for_file(temp_path)
+
+        # Load weighted districts
+        import geopandas as gpd, json
+        weighted_gdf = gpd.read_file(weighted_path)
+
+        # GeoJSON to python dict
+        geojson_obj = json.loads(weighted_gdf.to_json())
+
+        # Extract score columns
+        scores = weighted_gdf[[
+            "geometry_score",
+            "partisan_score",
+            "competitiveness_score",
+            "demographics_score",
+            "composite_score"
+        ]].to_dict(orient="records")
+
+        logger.info(f"Successfully computed weighted scores for {safe_filename}")
+
+    except Exception as e:
+        logger.error(f"Metric computation failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to compute metrics",
+            headers={"X-Error-Code": "metric_computation_failed"}
+        )
+
+    bbox = weighted_gdf.total_bounds.tolist()
+    num_features = len(weighted_gdf)
+
     UPLOAD_SUCCESS.inc()
 
-    return JSONResponse(content={
-        "upload_id": upload_id,
-        "filename": sanitize_filename(file.filename),
-        "num_districts": num_features,
-        "geojson": geojson_obj,
-        "bbox": bbox,
-        "status": "Map uploaded successfully"
-    })
-# -- End of Upload Handling -----------------------------------------------------------------
-# --- Utility Functions End ------------------------------------------------------------------
-
-# --- Endpoints ------------------------------------------------------------------------------
+    return JSONResponse(
+        content={
+            "upload_id": upload_id,
+            "filename": safe_filename,
+            "num_districts": num_features,
+            "geojson": geojson_obj,
+            "scores": scores,
+            "bbox": bbox,
+            "status": "Map uploaded & metrics computed"
+        }
+    )
 
 @app.post("/upload-map")
 async def upload_map(file: UploadFile = File(...), request: Request = None):
