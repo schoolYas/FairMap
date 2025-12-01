@@ -14,8 +14,10 @@ import io                                           # For in-memory byte streams
 from concurrent.futures import ThreadPoolExecutor   # Run blocking code (like geopandas) in threads
 from collections import defaultdict                 # Store per-IP upload history easily
 from shapely.geometry import shape                  # Handle geometric shapes and operations
+from ensemble_mcmc import run_mcmc_ensemble
+from fastapi import UploadFile, File
+from fastapi.responses import JSONResponse
 
-#test
 
 # --- PROJ database fix (macOS / Conda) --------------------------
 proj_candidate = "/Users/headhoncho/miniforge3/envs/fairmap/share/proj"
@@ -534,10 +536,9 @@ def calculate_basic_metrics(gdf: gpd.GeoDataFrame) -> dict:
     }
 
 #-- Upload Handling ------------------------------------------------------------------------------
-
 async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_final_chunk: bool):
 
- # Read ENTIRE file at once (NO CHUNKING)
+    # Read ENTIRE file at once (NO CHUNKING)
     contents = await file.read()
 
     if len(contents) > MAX_FILE_SIZE:
@@ -563,9 +564,9 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
                 headers={"X-Error-Code": "invalid_mime"}
             )
     elif ext == ".zip" and mime_type not in (
-    "application/zip",
-    "application/x-zip-compressed",
-    "application/octet-stream"
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/octet-stream"
     ):
         raise HTTPException(
             status_code=400,
@@ -596,27 +597,25 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
     except Exception as e:
         logger.warning(f"Skipping reprojection due to error: {e}")
 
-    # --- SAVE TEMP FILE FOR METRIC SCRIPT ---
     safe_filename = sanitize_filename(file.filename)
-    temp_path = f"/tmp/{upload_id}.geojson"
-    gdf.to_file(temp_path, driver="GeoJSON")
 
     # ============================================================
-    # 🔥 RUN WEIGHTED METRIC COMPUTATION ON THE UPLOADED FILE
+    # 🔥 RUN WEIGHTED METRIC COMPUTATION IN-MEMORY (NO TEMP FILE)
     # ============================================================
     try:
-        from calculate_metrics import compute_metrics_for_file
-        weighted_path = compute_metrics_for_file(temp_path)
+        from calculate_metrics import compute_metrics_for_gdf, compute_state_composite
 
-        # Load weighted districts
-        import geopandas as gpd, json
-        weighted_gdf = gpd.read_file(weighted_path)
+        # district-level metrics
+        districts = compute_metrics_for_gdf(gdf)
 
-        # GeoJSON to python dict
-        geojson_obj = json.loads(weighted_gdf.to_json())
+        # single plan-level composite score (for ensembling / fairness meter)
+        state_composite = compute_state_composite(districts)
 
-        # Extract score columns
-        scores = weighted_gdf[[
+        # GeoJSON → python dict for frontend
+        geojson_obj = json.loads(districts.to_json())
+
+        # Extract score columns per district
+        scores = districts[[
             "geometry_score",
             "partisan_score",
             "competitiveness_score",
@@ -634,10 +633,8 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
             headers={"X-Error-Code": "metric_computation_failed"}
         )
 
-    bbox = weighted_gdf.total_bounds.tolist()
-    num_features = len(weighted_gdf)
-
-    UPLOAD_SUCCESS.inc()
+    bbox = districts.total_bounds.tolist()
+    num_features = len(districts)
 
     return JSONResponse(
         content={
@@ -647,9 +644,13 @@ async def _handle_upload(file: UploadFile, client_ip: str, upload_id: str, is_fi
             "geojson": geojson_obj,
             "scores": scores,
             "bbox": bbox,
+            # optional: plan-level composite for later ensembling UI
+            "state_composite_score": state_composite,
             "status": "Map uploaded & metrics computed"
         }
     )
+
+
 
 @app.post("/upload-map")
 async def upload_map(file: UploadFile = File(...), request: Request = None):
@@ -745,6 +746,50 @@ async def predict_outcome(input_data: PredictionInput):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e), headers = {"X-Error-Code": "invalid_exception"})
+    
+@app.post("/ensemble-metrics")
+async def ensemble_metrics(file: UploadFile, num_plans: int = 100, thin: int = 20, k: int = 13):
+    """
+    Run an ensemble simulation on an uploaded map and return a distribution
+    of state_composite scores.
+    """
+    validate_file_type(file.filename)
+
+    # Decode file to precinct-level gdf (same as /calculate-metrics)
+    if file.filename.endswith(".geojson"):
+        gdf = await read_geojson(file)
+    elif file.filename.endswith(".zip"):
+        gdf = await read_shapefile_zip(file)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format",
+            headers={"X-Error-Code": "invalid_file_format"}
+        )
+
+    gdf = fix_invalid_geometries(gdf)
+
+    try:
+        results = run_mcmc_ensemble(
+            gdf_precincts=gdf,
+            k=k,
+            n_plans=num_plans,
+            thin=thin,
+            pop_col="TOTPOP",
+            pop_tol=0.05,
+        )
+        return JSONResponse(content={
+            "filename": file.filename,
+            "num_plans": num_plans,
+            "results": results,
+            "status": "Ensemble simulation completed"
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ensemble failed: {e}",
+            headers={"X-Error-Code": "ensemble_failed"}
+        )
 
 @app.post("/metrics")
 async def metrics_from_geojson_body(geojson: dict):

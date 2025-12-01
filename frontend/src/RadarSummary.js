@@ -24,7 +24,7 @@ ChartJS.register(
   Legend
 );
 
-export default function RadarSummary({ scores }) {
+export default function RadarSummary({ scores, planScore }) {
   if (!scores || scores.length === 0) return null;
 
   // Compute averages
@@ -35,6 +35,8 @@ export default function RadarSummary({ scores }) {
     demographic: mean(scores.map(s => s.demographics_score)),
     composite: mean(scores.map(s => s.composite_score))
   };
+
+  const displayComposite = typeof planScore === "number" ? planScore : avg.composite;
 
   const chartData = {
     labels: [
@@ -77,6 +79,7 @@ export default function RadarSummary({ scores }) {
     }
   };
 
+ 
   return (
     <div style={{ textAlign: "center" }}>
       <h3 style={{ marginBottom: "10px" }}>Fairness Summary</h3>
@@ -85,13 +88,21 @@ export default function RadarSummary({ scores }) {
       <Radar data={chartData} options={options} />
 
       {/* Composite Score */}
-      <div style={{
-        marginTop: "15px",
-        fontSize: "18px",
-        fontWeight: "bold"
-      }}>
-        Total Fairness Score: {(avg.composite * 100).toFixed(1)}
+      <div
+        style={{
+          marginTop: "15px",
+          fontSize: "18px",
+          fontWeight: "bold",
+        }}
+      >
+        Total Fairness Score: {(displayComposite * 100).toFixed(1)}
       </div>
+
+      {typeof planScore === "number" && (
+        <div style={{ marginTop: "4px", fontSize: "13px", color: "#666" }}>
+          (Plan-level composite from backend; radar shows district averages)
+        </div>
+      )}
     </div>
   );
 }

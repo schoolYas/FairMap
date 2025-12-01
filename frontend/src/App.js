@@ -68,34 +68,81 @@ function Home() {
   const [filename, setFilename] = useState("");
   const [scores, setScores] = useState(null);  // ⭐ for summary chart
   const fileInputRef = useRef(null);
+  const [planScore, setPlanScore] = useState(null); // ⭐ NEW: overall composite
+  const [ensembleResults, setEnsembleResults] = useState(null); // ⭐ NEW: ensemble plans
 
-  async function handleFileSelected(event) {
-    const file = event.target.files[0];
-    if (!file) return;
 
-    const formData = new FormData();
-    formData.append("file", file);
 
+
+ async function handleFileSelected(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try {
+    // 1) MAIN UPLOAD
+    const res = await fetch("http://127.0.0.1:8000/upload-map", {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      alert("Upload failed: " + (data.detail || "Unknown error"));
+      return;
+    }
+
+    // ✅ Upload success — update map + scores
+    setGeoData(data.geojson);
+    setFilename(data.filename);
+    setScores(data.scores);
+    setPlanScore(
+      typeof data.state_composite_score === "number"
+        ? data.state_composite_score
+        : null
+    );
+
+    // 2) ENSEMBLE CALL (does NOT break upload if it fails)
     try {
-      const res = await fetch("http://127.0.0.1:8000/upload-map", {
+      const ensForm = new FormData();
+      ensForm.append("file", file);
+
+      const ensRes = await fetch("http://127.0.0.1:8000/ensemble-metrics", {
         method: "POST",
-        body: formData,
+        body: ensForm,
       });
 
-      const data = await res.json();
-
-      if (res.ok) {
-        setGeoData(data.geojson);
-        setFilename(data.filename);
-        setScores(data.scores);  // ⭐ send scores to chart
+      const contentType = ensRes.headers.get("content-type") || "";
+      let ensData = null;
+      if (contentType.includes("application/json")) {
+        ensData = await ensRes.json();
       } else {
-        alert("Upload failed: " + data.detail);
+        // if backend sent text/html on error
+        const text = await ensRes.text();
+        console.error("Non-JSON ensemble response:", text);
+        ensData = null;
       }
-    } catch (err) {
-      alert("Upload failed. Check console.");
-      console.error(err);
+
+      console.log("ensemble response", ensData);
+
+      if (ensRes.ok && ensData && Array.isArray(ensData.results)) {
+        setEnsembleResults(ensData.results);
+      } else {
+        setEnsembleResults(null);
+      }
+    } catch (ensErr) {
+      console.error("Ensemble request failed:", ensErr);
+      setEnsembleResults(null);
     }
+  } catch (err) {
+    alert("Upload failed. Check console.");
+    console.error("Upload error:", err);
   }
+}
+
 
   return (
     <div style={styles.homeContainer}>
@@ -134,7 +181,7 @@ function Home() {
             boxShadow: "0 0 10px rgba(0,0,0,0.12)",
             height: "fit-content"
           }}>
-            <RadarSummary scores={scores} />
+            <RadarSummary scores={scores} planScore={planScore} />
           </div>
         )}
 
@@ -186,7 +233,7 @@ function Home() {
         </div>
       </div>
 
-      {/* ⭐ DISTRICT SCORES BELOW EVERYTHING */}
+            {/* ⭐ DISTRICT SCORES BELOW EVERYTHING */}
       {scores && (
         <div style={{ marginTop: "30px", textAlign: "left" }}>
           <h3>District Scores</h3>
@@ -200,8 +247,21 @@ function Home() {
               <strong>Composite: {s.composite_score.toFixed(3)}</strong>
             </div>
           ))}
+
+          {/* ⭐ NEW: quick ensemble summary */}
+          {ensembleResults && ensembleResults.length > 0 && (
+            <div style={{ marginTop: "20px" }}>
+              <h3>Ensemble Analysis</h3>
+              <p>Simulated plans: {ensembleResults.length}</p>
+              <p>
+                Example composite from first simulated plan:{" "}
+                {ensembleResults[0].state_composite.toFixed(3)}
+              </p>
+            </div>
+          )}
         </div>
       )}
+
     </div>
   );
 }
