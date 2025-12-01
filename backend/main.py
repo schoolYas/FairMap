@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor   # Run blocking code (like ge
 from collections import defaultdict                 # Store per-IP upload history easily
 from shapely.geometry import shape                  # Handle geometric shapes and operations
 
+#test
+
 # --- PROJ database fix (macOS / Conda) --------------------------
 proj_candidate = "/Users/headhoncho/miniforge3/envs/fairmap/share/proj"
 if os.path.exists(os.path.join(proj_candidate, "proj.db")):
@@ -50,14 +52,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request   # Core F
 from fastapi.responses import JSONResponse, FileResponse                # Send JSON or CSV responses
 from pydantic import BaseModel                                          # Define input models for predictions
 from contextlib import asynccontextmanager                              # Used in Cleanup and Upload Tracking 
-
-# --- Local imports ----------------------------------------------------------------------------
-from logging_setup import logger, UPLOAD_SUCCESS, UPLOAD_FAILURE, UPLOAD_SIZE, UPLOAD_LATENCY
-# logger: logging setup for backend
-# UPLOAD_SUCCESS/UPLOAD_FAILURE: Prometheus counters for upload results
-# UPLOAD_SIZE: Histogram of upload sizes
-# UPLOAD_LATENCY: Histogram of upload processing time
-#-----------------------------------------------------------------------------------------------
 
 #---- Abandoned Upload Cleaner -----------------------------------------------------------------
 
