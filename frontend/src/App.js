@@ -1,7 +1,7 @@
 import React, { useState, useRef } from "react";
 import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import Upload from "./pages/Upload";
-import Metrics from "./pages/Metrics";
+import Glossary from "./pages/Glossary";
 import About from "./pages/About";
 
 import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";
@@ -47,7 +47,7 @@ function HamburgerMenu({ open, onClose }) {
       <nav style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
         <Link to="/" style={menuLink}>Home</Link>
         <Link to="/upload" style={menuLink}>Upload</Link>
-        <Link to="/metrics" style={menuLink}>Metrics</Link>
+        <Link to="/glossary" style={menuLink}>Glossary</Link>
         <Link to="/about" style={menuLink}>About</Link>
       </nav>
     </div>
@@ -262,7 +262,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/upload" element={<Upload />} />
-          <Route path="/metrics" element={<Metrics />} />
+          <Route path="/glossary" element={<Glossary />} />
           <Route path="/about" element={<About />} />
         </Routes>
       </main>
