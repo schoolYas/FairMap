@@ -1,14 +1,12 @@
-import React, { useState, useRef } from "react";
-import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
-import Upload from "./pages/Upload";
-import Glossary from "./pages/Glossary";
-import About from "./pages/About";
-
-import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";
-import "leaflet/dist/leaflet.css";
-import "leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility.css";
-import "./App.css";
-import RadarSummary from "./RadarSummary";   // ⭐ NEW IMPORT
+import React, { useState, useRef } from "react";                                        // Imports react tools
+import { BrowserRouter, Routes, Route, Link } from "react-router-dom";                  // Imports react tools
+import Glossary from "./pages/Glossary";                                                // Used in hamburger menu selection
+import About from "./pages/About";                                                      // Used in hamburger menu selection
+import { MapContainer, TileLayer, GeoJSON } from "react-leaflet";                       // Used in map visualization
+import "leaflet/dist/leaflet.css";                                                      // Imports leaflet css
+import "leaflet-defaulticon-compatibility/dist/leaflet-defaulticon-compatibility.css";  // Imports leaflet css
+import "./App.css";                                                                     // Imports style file for page
+import RadarSummary from "./RadarSummary";                                              // Imports radar for data visualization
 
 /* -----------------------------
    HAMBURGER MENU (SLIDE-IN)
@@ -43,10 +41,8 @@ function HamburgerMenu({ open, onClose }) {
       >
         ✕
       </button>
-
       <nav style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
         <Link to="/" style={menuLink}>Home</Link>
-        <Link to="/upload" style={menuLink}>Upload</Link>
         <Link to="/glossary" style={menuLink}>Glossary</Link>
         <Link to="/about" style={menuLink}>About</Link>
       </nav>
@@ -54,8 +50,9 @@ function HamburgerMenu({ open, onClose }) {
   );
 }
 
-const menuLink = {
-  fontSize: "18px",
+
+const menuLink = {                                                                          // Sets style for menu text
+  fontSize: "18px", 
   color: "#333",
   textDecoration: "none",
 };
@@ -64,58 +61,55 @@ const menuLink = {
            HOME PAGE
 ------------------------------*/
 function Home() {
-  const [geoData, setGeoData] = useState(null);
-  const [filename, setFilename] = useState("");
-  const [scores, setScores] = useState(null);  // ⭐ for summary chart
-  const fileInputRef = useRef(null);
-  const [planScore, setPlanScore] = useState(null); // ⭐ NEW: overall composite
-  const [ensembleResults, setEnsembleResults] = useState(null); // ⭐ NEW: ensemble plans
-
-
-
+  const [geoData, setGeoData] = useState(null);                                             // Used to grab map information
+  const [filename, setFilename] = useState("");                                             // Used to set and grab file name
+  const [scores, setScores] = useState(null);                                               // Used in summary chart
+  const fileInputRef = useRef(null);                                                        // Used in grabbing file infomation
+  const [planScore, setPlanScore] = useState(null);                                         // Used in overall composite
+  const [ensembleResults, setEnsembleResults] = useState(null);                             // Used in ensemble plans
 
  async function handleFileSelected(event) {
   const file = event.target.files[0];
   if (!file) return;
 
-  const formData = new FormData();
+  const formData = new FormData();                                                          // Creates File object with data
   formData.append("file", file);
 
-  try {
-    // 1) MAIN UPLOAD
+
+  try {                                                                                     // Attempts to Upload Map 
     const res = await fetch("http://127.0.0.1:8000/upload-map", {
       method: "POST",
       body: formData,
     });
 
-    const data = await res.json();
+    const data = await res.json();                                                          // Awaits data to upload for map
 
-    if (!res.ok) {
+    
+    if (!res.ok) {                                                                          // Gives messages if upload fails 
       alert("Upload failed: " + (data.detail || "Unknown error"));
       return;
     }
 
-    // ✅ Upload success — update map + scores
-    setGeoData(data.geojson);
-    setFilename(data.filename);
-    setScores(data.scores);
-    setPlanScore(
+    // If upload is successful — update map + scores
+    setGeoData(data.geojson);                                                               // Sets map data
+    setFilename(data.filename);                                                             // Sets file name
+    setScores(data.scores);                                                                 // Sets metric scores
+    setPlanScore(                                                                           // Sets ensembling scores
       typeof data.state_composite_score === "number"
         ? data.state_composite_score
         : null
     );
 
-    // 2) ENSEMBLE CALL (does NOT break upload if it fails)
-    try {
+    try {                                                                                   // Calls for Ensembling
       const ensForm = new FormData();
       ensForm.append("file", file);
 
-      const ensRes = await fetch("http://127.0.0.1:8000/ensemble-metrics", {
+      const ensRes = await fetch("http://127.0.0.1:8000/ensemble-metrics", {               // Attempts to run ensembling
         method: "POST",
         body: ensForm,
       });
 
-      const contentType = ensRes.headers.get("content-type") || "";
+      const contentType = ensRes.headers.get("content-type") || "";                        
       let ensData = null;
       if (contentType.includes("application/json")) {
         ensData = await ensRes.json();
@@ -321,7 +315,6 @@ function App() {
       <main style={{ paddingTop: "70px" }}>
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/upload" element={<Upload />} />
           <Route path="/glossary" element={<Glossary />} />
           <Route path="/about" element={<About />} />
         </Routes>

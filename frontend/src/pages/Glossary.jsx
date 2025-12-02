@@ -1,9 +1,7 @@
-// src/pages/Metrics.jsx
 import { useState } from "react";
-
 const pink = "#ff4da6";
 
-// --- Academic Gerrymandering Terms ---
+// --- Academic Gerrymandering Terms -----------------
 const TERMS = [
   {
     term: "Compactness",
@@ -86,8 +84,11 @@ const TERMS = [
 // --------------------------------------------------
 
 export default function Glossary() {
+
+    //
   const [query, setQuery] = useState("");
 
+  //
   const filtered = TERMS.filter((t) =>
     t.term.toLowerCase().includes(query.toLowerCase())
   );
@@ -99,7 +100,9 @@ export default function Glossary() {
         type="text"
         placeholder="Search glossary…"
         value={query}
+        // Sets placeholder test awaiting a query value
         onChange={(e) => setQuery(e.target.value)}
+        // Search Bar Styling
         style={{
           width: "100%",
           padding: "12px",
@@ -150,6 +153,7 @@ export default function Glossary() {
         </tbody>
       </table>
 
+       // If query does not match any of the terms, returns text 
       {filtered.length === 0 && (
         <p style={{ marginTop: "20px", color: pink }}>No terms match your search.</p>
       )}
