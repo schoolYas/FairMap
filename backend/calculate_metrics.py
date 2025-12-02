@@ -16,19 +16,49 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     composite_score, ready for frontend or ensembling use.
     """
 
+    # Work on a copy so we don't mutate the caller's data
+    gdf = gdf.copy()
+
+    # ------------------------------------------------------------------
+    # 1) Make sure we have CD and TOTPOP so downstream code doesn't blow
+    # ------------------------------------------------------------------
+    if "CD" not in gdf.columns:
+        gdf["CD"] = np.arange(len(gdf))
+
+    if "TOTPOP" not in gdf.columns:
+        gdf["TOTPOP"] = 1.0
+
     # -----------------------------
-    # Aggregate by district
+    # 2) Aggregate by district
     # -----------------------------
     agg_cols = [
         c for c in gdf.columns
-        if c != "geometry" and np.issubdtype(gdf[c].dtype, np.number)
+        if c not in ("geometry", "CD") and np.issubdtype(gdf[c].dtype, np.number)
     ]
 
-    districts = gdf.dissolve(by="CD", aggfunc="sum")[agg_cols]
-    geometry = gdf.dissolve(by="CD").geometry
-    districts["geometry"] = geometry
-    districts = GeoDataFrame(districts, geometry=districts["geometry"], crs=gdf.crs)
-    metric_geom = districts.to_crs("EPSG:5070")  # US equal-area CRS (good enough baseline)
+    dissolved = gdf.dissolve(by="CD", aggfunc="sum")
+
+    if "geometry" not in dissolved.columns:
+        dissolved = dissolved.set_geometry("geometry")
+
+    districts = dissolved[agg_cols].copy()
+    districts["geometry"] = dissolved.geometry
+    districts = GeoDataFrame(districts, geometry="geometry", crs=gdf.crs)
+
+    # equal-area CRS for geometry-based scores
+    if districts.crs is None:
+        # Fallback: use current coordinates as-is (OK for dummy test maps)
+        metric_geom = districts
+    else:
+        metric_geom = districts.to_crs("EPSG:5070")  # US equal-area CRS (good enough baseline)
+
+    # ------------------------------------------------------------------
+    # 3) Ensure basic geometry columns exist (Shape_Area, Shape_Leng)
+    # ------------------------------------------------------------------
+    if "Shape_Area" not in districts.columns:
+        districts["Shape_Area"] = metric_geom.geometry.area
+    if "Shape_Leng" not in districts.columns:
+        districts["Shape_Leng"] = metric_geom.geometry.length
 
     # -----------------------------
     # Geometry Metrics
@@ -44,7 +74,6 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         except Exception:
             return np.nan
 
-
     districts["Reock"] = metric_geom["geometry"].apply(reock_score)
     districts["PA_ratio"] = districts["Shape_Leng"] / districts["Shape_Area"]
     districts["ConvexHull_ratio"] = 1 - (
@@ -53,6 +82,34 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     districts["Schwartzberg"] = 1 - (
         np.sqrt(4 * np.pi * districts["Shape_Area"]) / districts["Shape_Leng"]
     )
+
+    # ------------------------------------------------------------------
+    # 4) Ensure demographic + vote columns exist (for dummy files)
+    # ------------------------------------------------------------------
+    # VAP
+    if "VAP" not in districts.columns:
+        if "TOTPOP" in districts.columns:
+            districts["VAP"] = districts["TOTPOP"]
+        else:
+            districts["VAP"] = 1.0
+
+    # Race columns
+    for col in ["BVAP", "HVAP", "WVAP", "AMINVAP"]:
+        if col not in districts.columns:
+            districts[col] = 0.0
+
+    # If all race counts are 0, assume everyone is WVAP so Diversity_index isn't NaN
+    race_sum = districts[["BVAP", "HVAP", "WVAP", "AMINVAP"]].sum(axis=1)
+    mask_zero_race = race_sum == 0
+    districts.loc[mask_zero_race, "WVAP"] = districts.loc[mask_zero_race, "VAP"]
+
+    # Vote columns
+    for col in ["EL16G_PR_D", "EL16G_PR_R"]:
+        if col not in districts.columns:
+            districts[col] = 0.0
+
+    vote_totals = districts["EL16G_PR_D"] + districts["EL16G_PR_R"]
+    has_any_votes = (vote_totals > 0).any()
 
     # -----------------------------
     # Partisan Metrics
@@ -74,40 +131,66 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     )
     districts["EG"] = abs(districts["dem_wasted"] - districts["rep_wasted"]) / districts["total_votes"].replace(0, 1)
 
-    # regression-adjusted EG
-    districts["Black_frac"] = districts["BVAP"] / districts["VAP"]
-    districts["Hispanic_frac"] = districts["HVAP"] / districts["VAP"]
-    districts["White_frac"] = districts["WVAP"] / districts["VAP"]
-    districts["Native_frac"] = districts["AMINVAP"] / districts["VAP"]
+    # -----------------------------
+    # Regression-adjusted EG (only if we actually have vote data)
+    # -----------------------------
+    if has_any_votes:
+        districts["Black_frac"] = districts["BVAP"] / districts["VAP"]
+        districts["Hispanic_frac"] = districts["HVAP"] / districts["VAP"]
+        districts["White_frac"] = districts["WVAP"] / districts["VAP"]
+        districts["Native_frac"] = districts["AMINVAP"] / districts["VAP"]
 
-    X = districts[["Black_frac", "Hispanic_frac", "White_frac", "Native_frac"]]
-    X = sm.add_constant(X)
-    y = districts["EL16G_PR_D"] / (districts["EL16G_PR_D"] + districts["EL16G_PR_R"])
+        X = districts[["Black_frac", "Hispanic_frac", "White_frac", "Native_frac"]]
+        X = sm.add_constant(X)
 
-    model = sm.OLS(y, X).fit()
-    districts["expected_dem_share"] = model.predict(X)
-    districts["residual_dem_share"] = y - districts["expected_dem_share"]
+        valid = vote_totals > 0
+        y = pd.Series(0.5, index=districts.index)
+        y.loc[valid] = districts.loc[valid, "EL16G_PR_D"] / vote_totals.loc[valid]
 
-    def wasted_votes_regression(row):
-        dem_share = row["residual_dem_share"] + 0.5
-        rep_share = 1 - dem_share
-        total = row["VAP"] if row["VAP"] > 0 else 1
+        try:
+            model = sm.OLS(y.loc[valid], X.loc[valid]).fit()
+            districts["expected_dem_share"] = model.predict(X)
+        except Exception:
+            districts["expected_dem_share"] = 0.5
 
-        dem_v = dem_share * total
-        rep_v = rep_share * total
+        districts["residual_dem_share"] = y - districts["expected_dem_share"]
 
-        dem_w = dem_v - (total / 2) if dem_v > rep_v else dem_v
-        rep_w = rep_v - (total / 2) if rep_v > dem_v else rep_v
-        return dem_w, rep_w, total
+        def wasted_votes_regression(row):
+            dem_share = row["residual_dem_share"] + 0.5
+            rep_share = 1 - dem_share
+            total = row["VAP"] if row["VAP"] > 0 else 1
 
-    districts[["dem_wasted_reg", "rep_wasted_reg", "total_votes_reg"]] = districts.apply(
-        lambda r: pd.Series(wasted_votes_regression(r)), axis=1
-    )
-    districts["EG_reg"] = (districts["dem_wasted_reg"] - districts["rep_wasted_reg"]) / districts["total_votes_reg"]
+            dem_v = dem_share * total
+            rep_v = rep_share * total
 
-    # Mean–Median
-    dem_share = districts["EL16G_PR_D"] / (districts["EL16G_PR_D"] + districts["EL16G_PR_R"])
-    districts["MM"] = dem_share.mean() - dem_share.median()
+            dem_w = dem_v - (total / 2) if dem_v > rep_v else dem_v
+            rep_w = rep_v - (total / 2) if rep_v > dem_v else rep_v
+            return dem_w, rep_w, total
+
+        districts[["dem_wasted_reg", "rep_wasted_reg", "total_votes_reg"]] = districts.apply(
+            lambda r: pd.Series(wasted_votes_regression(r)), axis=1
+        )
+        districts["EG_reg"] = (districts["dem_wasted_reg"] - districts["rep_wasted_reg"]) / districts["total_votes_reg"]
+
+        dem_share = y
+    else:
+        # Neutral defaults when there is no vote data at all (like your test_map.geojson)
+        districts["Black_frac"] = 0.0
+        districts["Hispanic_frac"] = 0.0
+        districts["White_frac"] = 1.0
+        districts["Native_frac"] = 0.0
+
+        districts["expected_dem_share"] = 0.5
+        districts["residual_dem_share"] = 0.0
+        districts["dem_wasted_reg"] = 0.0
+        districts["rep_wasted_reg"] = 0.0
+        districts["total_votes_reg"] = 1.0
+        districts["EG_reg"] = 0.0
+
+        dem_share = pd.Series(0.5, index=districts.index)
+
+    # Mean–Median, Partisan bias, Competitive_flag
+    districts["MM"] = float(dem_share.mean() - dem_share.median())
     districts["Partisan_bias"] = dem_share - 0.5
     districts["Competitive_flag"] = ((dem_share > 0.45) & (dem_share < 0.55)).astype(float)
 
@@ -118,7 +201,7 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         dem, rep = r["EL16G_PR_D"], r["EL16G_PR_R"]
         total = dem + rep
         if total == 0:
-            return 0.01
+            return 0.5
         margin = abs(dem - rep) / total
         return np.clip(1 - margin, 0.01, 0.99)
 
@@ -150,7 +233,6 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         'Minority', 'Hispanic_frac', 'Black_frac', 'Diversity_index'
     ]
 
-    # 5–95% clipping
     for col in metrics:
         col_data = districts[col].dropna()
         if len(col_data) == 0:
@@ -158,7 +240,6 @@ def compute_metrics_for_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         lo, hi = np.percentile(col_data, [5, 95])
         districts[col] = districts[col].clip(lo, hi)
 
-    # rank normalize to 0.01–0.99
     districts[metrics] = districts[metrics].rank(pct=True) * 0.98 + 0.01
 
     # -----------------------------

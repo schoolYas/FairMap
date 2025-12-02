@@ -8,6 +8,7 @@ import time                                         # Timing, rate-limiting, upl
 import uuid                                         # Generate unique IDs for chunked uploads
 import zipfile                                      # Handling uploaded zip files (shapefiles)
 import math                                         # Mathematical functions (e.g., sqrt, pi)
+import numpy as np                                  # Numerical operations and array handling
 from shapely.geometry import Polygon, MultiPolygon  # Geometric shapes and operations
 from io import BytesIO                              # In-memory file streams for uploads
 import io                                           # For in-memory byte streams    
@@ -371,7 +372,10 @@ def _gdf_from_geojson_bytes(contents: bytes) -> gpd.GeoDataFrame:
         geom = shape(f.get("geometry")) if f.get("geometry") else None
         props = f.get("properties", {}) or {}
         rows.append({**props, "geometry": geom})
-    return gpd.GeoDataFrame(rows, geometry="geometry")
+
+    # tell GeoPandas that this is WGS84 / EPSG:4326
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+    return gdf
     
 async def read_geojson(file_or_bytes) -> gpd.GeoDataFrame:
     """
@@ -755,7 +759,7 @@ async def ensemble_metrics(file: UploadFile, num_plans: int = 100, thin: int = 2
     """
     validate_file_type(file.filename)
 
-    # Decode file to precinct-level gdf (same as /calculate-metrics)
+    # read the uploaded file into a GeoDataFrame
     if file.filename.endswith(".geojson"):
         gdf = await read_geojson(file)
     elif file.filename.endswith(".zip"):
@@ -763,13 +767,38 @@ async def ensemble_metrics(file: UploadFile, num_plans: int = 100, thin: int = 2
     else:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file format",
-            headers={"X-Error-Code": "invalid_file_format"}
+            detail="Unsupported file type for ensemble-metrics",
+            headers={"X-Error-Code": "unsupported_file_type"},
         )
 
+    # clean geometries
     gdf = fix_invalid_geometries(gdf)
 
+    # ------------------------------------------------------------------
+    # Ensure we have CD + TOTPOP even for generic test maps.
+    # Real precinct data already has these, so this is just a dev fallback.
+    # ------------------------------------------------------------------
+    if "CD" not in gdf.columns:
+        gdf["CD"] = np.arange(len(gdf))
+    if "TOTPOP" not in gdf.columns:
+        gdf["TOTPOP"] = 1.0
+        
+    # ------------------------------------------------------------------
+    # Ensure Shape_Area / Shape_Leng exist for ensemble_mcmc
+    # ------------------------------------------------------------------
+    if gdf.crs is None:
+        # Fallback: don't reproject, just use current coordinates
+        metric_geom = gdf
+    else:
+        metric_geom = gdf.to_crs("EPSG:5070")
+
+    if "Shape_Area" not in gdf.columns:
+        gdf["Shape_Area"] = metric_geom.geometry.area
+    if "Shape_Leng" not in gdf.columns:
+        gdf["Shape_Leng"] = metric_geom.geometry.length
+
     try:
+        # run the MCMC ensemble
         results = run_mcmc_ensemble(
             gdf_precincts=gdf,
             k=k,
@@ -778,17 +807,82 @@ async def ensemble_metrics(file: UploadFile, num_plans: int = 100, thin: int = 2
             pop_col="TOTPOP",
             pop_tol=0.05,
         )
-        return JSONResponse(content={
-            "filename": file.filename,
-            "num_plans": num_plans,
-            "results": results,
-            "status": "Ensemble simulation completed"
-        })
+
+        if not results:
+            # No valid ensemble plans → treat as degenerate
+            summary = {
+                "mean": None,
+                "std": 0.0,
+                "threshold": None,
+                "num_gerrymandered": 0,
+                "degenerate": True,
+            }
+            return JSONResponse(
+                content={
+                    "filename": file.filename,
+                    "num_plans": num_plans,
+                    "results": [],
+                    "summary": summary,
+                    "status": "Ensemble produced no plans",
+                }
+            )
+
+        # pull out the composite scores from the sampled plans
+        scores = np.array(
+            [float(r["state_composite"]) for r in results],
+            dtype=float,
+        )
+
+        mean_score = float(scores.mean())
+
+        # --- clamp tiny std so toy maps don't blow up z-scores ---
+        eps = 1e-9
+        raw_std = float(scores.std(ddof=0))  # population std dev
+        std_score = raw_std if raw_std >= eps else 0.0
+
+        # if std is ~0, threshold = mean (no spread)
+        threshold = mean_score + 2.0 * std_score
+
+        # attach z-score and gerrymander flag to each sampled plan
+        # attach z-score and gerrymander flag to each sampled plan
+        for r in results:
+            s = float(r["state_composite"])
+
+            if std_score > 0:
+                z = (s - mean_score) / std_score
+            else:
+                # all plans basically the same → treat z-score as 0
+                z = 0.0
+
+            r["z_score"] = float(z)
+            r["is_gerrymandered"] = s > threshold
+
+        summary = {
+            "mean": mean_score,
+            "std": std_score,
+            "threshold": threshold,
+            "num_gerrymandered": int(
+                sum(1 for r in results if r["is_gerrymandered"])
+            ),
+            # this is helpful for the frontend yellow note
+            "degenerate": std_score == 0.0,
+        }
+
+        return JSONResponse(
+            content={
+                "filename": file.filename,
+                "num_plans": num_plans,
+                "results": results,
+                "summary": summary,
+                "status": "Ensemble simulation completed",
+            }
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Ensemble failed: {e}",
-            headers={"X-Error-Code": "ensemble_failed"}
+            headers={"X-Error-Code": "ensemble_failed"},
         )
 
 @app.post("/metrics")

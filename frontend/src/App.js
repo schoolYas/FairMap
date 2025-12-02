@@ -67,6 +67,7 @@ function Home() {
   const fileInputRef = useRef(null);                                                        // Used in grabbing file infomation
   const [planScore, setPlanScore] = useState(null);                                         // Used in overall composite
   const [ensembleResults, setEnsembleResults] = useState(null);                             // Used in ensemble plans
+  const [degenerateEnsemble, setDegenerateEnsemble] = useState(false);                      // Used to flag degenerate ensembles
 
  async function handleFileSelected(event) {
   const file = event.target.files[0];
@@ -104,10 +105,10 @@ function Home() {
       const ensForm = new FormData();
       ensForm.append("file", file);
 
-      const ensRes = await fetch("http://127.0.0.1:8000/ensemble-metrics", {               // Attempts to run ensembling
-        method: "POST",
-        body: ensForm,
-      });
+      const ensRes = await fetch("http://127.0.0.1:8000/ensemble-metrics", {                // Attempts to run ensembling
+      method: "POST",
+      body: ensForm,
+    });
 
       const contentType = ensRes.headers.get("content-type") || "";                        
       let ensData = null;
@@ -124,12 +125,18 @@ function Home() {
 
       if (ensRes.ok && ensData && Array.isArray(ensData.results)) {
         setEnsembleResults(ensData.results);
-      } else {
+
+        // use backend's "degenerate" flag directly
+        const deg = ensData?.summary?.degenerate ?? false;
+        setDegenerateEnsemble(Boolean(deg));
+        } else {
         setEnsembleResults(null);
+        setDegenerateEnsemble(false);
       }
     } catch (ensErr) {
       console.error("Ensemble request failed:", ensErr);
       setEnsembleResults(null);
+      setDegenerateEnsemble(false);
     }
   } catch (err) {
     alert("Upload failed. Check console.");
@@ -251,6 +258,22 @@ function Home() {
                 Example composite from first simulated plan:{" "}
                 {ensembleResults[0].state_composite.toFixed(3)}
               </p>
+
+              {degenerateEnsemble && (
+                <div
+                  style={{
+                    marginTop: "8px",
+                    padding: "8px 12px",
+                    borderRadius: "6px",
+                    backgroundColor: "#FEF3C7", // light yellow
+                    color: "#92400E",            // dark text
+                    fontSize: "14px",
+                  }}
+                >
+                  Ensemble results are degenerate for maps with too few districts
+                  or no real vote data.
+                </div>
+              )}
             </div>
           )}
         </div>
