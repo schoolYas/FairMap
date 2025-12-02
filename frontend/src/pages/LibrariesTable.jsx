@@ -1,8 +1,7 @@
 const PURPLE = "#5A45DD";
 
-
+{/* ----- Python Stack ----------------*/}
 const libraries = [
-  // ----- Python Stack ----------------
   {
     name: "GeoPandas",
     author: "GeoPandas contributors",
@@ -34,7 +33,7 @@ const libraries = [
     link: "https://shapely.readthedocs.io/",
   },
 
-  // ----- Frontend stack ------------------
+
   {
     name: "React",
     author: "Meta Open Source & community",
@@ -71,7 +70,7 @@ export default function LibrariesTable() {
         marginTop: "20px"
       }}
     >
-        // Sets a table with three components: tool, author, and link
+        {/* Sets a table with three components: tool, author, and link*/}
       <thead>
         <tr style={{ color: PURPLE, fontWeight: "bold", fontSize: "18px" }}>
           <th style={{ padding: "10px" }}>Component/Tool</th>
