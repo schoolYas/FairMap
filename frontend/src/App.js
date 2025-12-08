@@ -57,6 +57,11 @@ const menuLink = {                                                              
   textDecoration: "none",
 };
 
+// helper to format numbers safely
+function formatScore(value) {
+  return typeof value === "number" ? value.toFixed(3) : "N/A";
+}
+
 /* -----------------------------
            HOME PAGE
 ------------------------------*/
@@ -68,6 +73,8 @@ function Home() {
   const [planScore, setPlanScore] = useState(null);                                         // Used in overall composite
   const [ensembleResults, setEnsembleResults] = useState(null);                             // Used in ensemble plans
   const [degenerateEnsemble, setDegenerateEnsemble] = useState(false);                      // Used to flag degenerate ensembles
+  const [ensembleStats, setEnsembleStats] = useState(null);                                 // Used to store ensemble statistics
+  const [selectedDistrictIndex, setSelectedDistrictIndex] = useState(null);                 // Used to track clicked district
 
  async function handleFileSelected(event) {
   const file = event.target.files[0];
@@ -95,11 +102,15 @@ function Home() {
     setGeoData(data.geojson);                                                               // Sets map data
     setFilename(data.filename);                                                             // Sets file name
     setScores(data.scores);                                                                 // Sets metric scores
-    setPlanScore(                                                                           // Sets ensembling scores
+    setSelectedDistrictIndex(null);                                                         // Reset selected district on new upload
+
+    // Keep a local copy of the plan composite so we can use it below
+    const planComposite =
       typeof data.state_composite_score === "number"
         ? data.state_composite_score
-        : null
-    );
+        : null;
+
+    setPlanScore(planComposite);                                                           // Sets overall composite score 
 
     try {                                                                                   // Calls for Ensembling
       const ensForm = new FormData();
@@ -129,21 +140,113 @@ function Home() {
         // use backend's "degenerate" flag directly
         const deg = ensData?.summary?.degenerate ?? false;
         setDegenerateEnsemble(Boolean(deg));
+
+        // --- compute ensemble mean/std dev and flag ---
+        const composites = ensData.results
+          .map((r) => r.state_composite)
+          .filter((v) => typeof v === "number" && !Number.isNaN(v));
+
+        // use the local planComposite, not state planScore (which might still be null)
+        if (composites.length > 0 && typeof planComposite === "number") {
+          const mean =
+            composites.reduce((sum, v) => sum + v, 0) / composites.length;
+
+          const variance =
+            composites.reduce((sum, v) => sum + (v - mean) * (v - mean), 0) /
+            composites.length;
+
+          const stdDev = Math.sqrt(variance);
+          const threshold = mean + 2 * stdDev;
+          const gerrymandered =
+            typeof planComposite === "number" ? planComposite > threshold : false;
+
+          setEnsembleStats({
+            mean,
+            stdDev,
+            threshold,
+            gerrymandered,
+            planComposite, // store the actual number we used
+          });
         } else {
+          setEnsembleStats(null);
+        }
+      } else {
         setEnsembleResults(null);
         setDegenerateEnsemble(false);
+        setEnsembleStats(null);
       }
     } catch (ensErr) {
       console.error("Ensemble request failed:", ensErr);
       setEnsembleResults(null);
       setDegenerateEnsemble(false);
+      setEnsembleStats(null);
     }
   } catch (err) {
     alert("Upload failed. Check console.");
     console.error("Upload error:", err);
+    setEnsembleResults(null);
+    setDegenerateEnsemble(false);
+    setEnsembleStats(null);
   }
 }
 
+  function downloadDistrictScoresCSV() {
+    if (!scores || scores.length === 0) {
+      alert("No district scores available to download.");
+      return;
+    }
+
+    const header = [
+      "district",
+      "geometry_score",
+      "partisan_score",
+      "competitiveness_score",
+      "demographics_score",
+      "composite_score",
+    ];
+
+    const rows = scores.map((s, i) => [
+      i + 1,
+      s.geometry_score,
+      s.partisan_score,
+      s.competitiveness_score,
+      s.demographics_score,
+      s.composite_score,
+    ]);
+
+    const csvLines = [
+      header.join(","),
+      ...rows.map((r) => r.join(",")),
+    ];
+
+    const blob = new Blob([csvLines.join("\n")], {
+      type: "text/csv;charset=utf-8;",
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    const safeName = filename || "district_scores";
+    link.href = url;
+    link.download = `${safeName}_district_scores.csv`;
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
+  // Real gerrymander flag based on ensemble statistics
+  const isPlanGerrymandered =
+    ensembleStats &&
+    typeof ensembleStats.stdDev === "number" &&
+    ensembleStats.stdDev >= 1e-6 &&
+    ensembleStats.gerrymandered;
+
+  // Demo / testing only:
+  // If we want to force tips to always show, temporarily comment out the block
+  // above and use this instead (DO NOT COMMIT THIS):
+  // const isPlanGerrymandered = true;
 
   return (
     <div style={styles.homeContainer}>
@@ -166,7 +269,10 @@ function Home() {
           onChange={handleFileSelected}
         />
 
-        <button style={styles.secondaryBtn}>Learn More</button>
+        {/* Make Learn More navigate to /about */}
+        <Link to="/about" style={styles.secondaryBtn}>
+          Learn More
+        </Link>
       </div>
 
       {/* ⭐ SUMMARY PANEL + MAP WRAPPER */}
@@ -182,7 +288,12 @@ function Home() {
             boxShadow: "0 0 10px rgba(0,0,0,0.12)",
             height: "fit-content"
           }}>
-            <RadarSummary scores={scores} planScore={planScore} />
+            <RadarSummary
+              scores={scores}
+              selectedIndex={selectedDistrictIndex}
+              planScore={planScore}
+              isGerrymandered={isPlanGerrymandered}
+            />
           </div>
         )}
 
@@ -222,11 +333,36 @@ function Home() {
             {geoData && (
               <GeoJSON
                 data={geoData}
-                style={{
-                  color: "#ff4da6",
-                  weight: 3,
-                  fillColor: "#ff4da6",
-                  fillOpacity: 0.45,
+                // Style each feature, highlighting the one that is selected
+                style={(feature) => {
+                  if (!geoData || !geoData.features) {
+                    return {
+                      color: "#ff4da6",
+                      weight: 3,
+                      fillColor: "#ff4da6",
+                      fillOpacity: 0.45,
+                    };
+                  }
+
+                  const featureIndex = geoData.features.indexOf(feature);
+                  const isSelected = featureIndex === selectedDistrictIndex;
+
+                  return {
+                    color: isSelected ? "#000000" : "#ff4da6",  // Black outline if selected
+                    weight: isSelected ? 4 : 3,
+                    fillColor: "#ff4da6",
+                    fillOpacity: isSelected ? 0.6 : 0.45,
+                  };
+                }}
+                // When a polygon is clicked, update selectedDistrictIndex
+                onEachFeature={(feature, layer) => {
+                  layer.on("click", () => {
+                    if (!geoData || !geoData.features) return;
+                    const idx = geoData.features.indexOf(feature);
+                    if (idx !== -1) {
+                      setSelectedDistrictIndex(idx);
+                    }
+                  });
                 }}
               />
             )}
@@ -238,14 +374,32 @@ function Home() {
       {scores && (
         <div style={{ marginTop: "30px", textAlign: "left" }}>
           <h3>District Scores</h3>
+
+          {/* Download CSV button */}
+          <button
+            style={{
+              margin: "10px 0 20px 0",
+              padding: "8px 14px",
+              borderRadius: "6px",
+              border: "1px solid #5A45DD",
+              backgroundColor: "white",
+              color: "#5A45DD",
+              cursor: "pointer",
+              fontSize: "14px",
+            }}
+            onClick={downloadDistrictScoresCSV}
+          >
+            Download District Scores (CSV)
+          </button>
+
           {scores.map((s, i) => (
             <div key={i} style={{ marginBottom: "12px" }}>
               <strong>District {i + 1}</strong><br />
-              Geometry: {s.geometry_score.toFixed(3)}<br />
-              Partisan: {s.partisan_score.toFixed(3)}<br />
-              Competitiveness: {s.competitiveness_score.toFixed(3)}<br />
-              Demographics: {s.demographics_score.toFixed(3)}<br />
-              <strong>Composite: {s.composite_score.toFixed(3)}</strong>
+              Geometry: {formatScore(s.geometry_score)}<br />
+              Partisan: {formatScore(s.partisan_score)}<br />
+              Competitiveness: {formatScore(s.competitiveness_score)}<br />
+              Demographics: {formatScore(s.demographics_score)}<br />
+              <strong>Composite: {formatScore(s.composite_score)}</strong>
             </div>
           ))}
 
@@ -253,11 +407,42 @@ function Home() {
           {ensembleResults && ensembleResults.length > 0 && (
             <div style={{ marginTop: "20px" }}>
               <h3>Ensemble Analysis</h3>
+
               <p>Simulated plans: {ensembleResults.length}</p>
+
               <p>
-                Example composite from first simulated plan:{" "}
-                {ensembleResults[0].state_composite.toFixed(3)}
+                Ensemble mean composite:{" "}
+                {ensembleStats && typeof ensembleStats.mean === "number"
+                  ? ensembleStats.mean.toFixed(3)
+                  : "N/A"}
               </p>
+
+              <p>
+                Ensemble standard deviation:{" "}
+                {ensembleStats && typeof ensembleStats.stdDev === "number"
+                  ? ensembleStats.stdDev.toFixed(3)
+                  : "N/A"}
+              </p>
+
+              <p>
+                Uploaded plan composite:{" "}
+                {typeof planScore === "number"
+                  ? planScore.toFixed(3)
+                  : "N/A"}
+              </p>
+
+              {ensembleStats &&
+                typeof ensembleStats.mean === "number" &&
+                typeof ensembleStats.stdDev === "number" &&
+                typeof ensembleStats.planComposite === "number" && (
+                  <p>
+                    {ensembleStats.stdDev < 1e-6
+                      ? "The ensemble composites are all the same, so we can't meaningfully check for gerrymandering (standard deviation is 0)."
+                      : isPlanGerrymandered
+                        ? "This plan is considered gerrymandered (more than 2 standard deviations above the ensemble mean)."
+                        : "This plan is not flagged as gerrymandered (within 2 standard deviations of the ensemble mean)."}
+                  </p>
+                )}
 
               {degenerateEnsemble && (
                 <div
@@ -265,13 +450,13 @@ function Home() {
                     marginTop: "8px",
                     padding: "8px 12px",
                     borderRadius: "6px",
-                    backgroundColor: "#FEF3C7", // light yellow
-                    color: "#92400E",            // dark text
+                    backgroundColor: "#FEF3C7",
+                    color: "#92400E",
                     fontSize: "14px",
                   }}
                 >
-                  Ensemble results are degenerate for maps with too few districts
-                  or no real vote data.
+                  Ensemble results are degenerate for maps with too few
+                  districts or no real vote data.
                 </div>
               )}
             </div>
