@@ -1,4 +1,5 @@
-{/* Imports table with credits to all third-party sources*/}
+// Imports table with credits to all third-party sources
+import React from "react";
 import LibrariesTable from "./LibrariesTable";
 function About()
 {
@@ -41,9 +42,13 @@ function About()
       <p ><b>Yasamean Zaidi-Dozandeh</b> is the project director and has over 8 years of experience in software development. She has 
           previously worked for Apple in technical troubleshooting and has multiple projects in the Javascript and Python sphere.
           She is working towards a Bachelors of Science in Computer Science, to graduate in Spring 2025.
-         
       </p>
-      <p ><b>Contributors & Honorable Mentions:</b> Sidney Mcclendon, Dr. Amlan Chatterjee</p>
+
+      <p ><b>Sidney McClendon</b> is a co-developer on FairMap with a background in game development and digital content creation. She has experience
+        building high-quality 3D assets and interactive content pipelines using tools such as Blender, along with scripting in Lua, Java, and Python.
+        Sidney is also working towards a Bachelors of Science in Computer Science, to graduate in Spring 2025.
+      </p>
+      <p ><b>Contributors & Honorable Mentions:</b> Dr. Amlan Chatterjee</p>
 
      {/* Uses LibrariesTable to give Credit*/}
       <h2 >Credits</h2>
